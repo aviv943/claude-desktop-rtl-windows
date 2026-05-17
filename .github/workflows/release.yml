@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g. v1.0.0)'
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ github.event.inputs.version }}
+          git push origin ${{ github.event.inputs.version }}
+
+      - name: Build release ZIP
+        run: |
+          mkdir release
+          cp patch.ps1 rtl-payload.js install.bat README.md LICENSE release/
+          cd release && zip -r ../claude-desktop-rtl-windows.zip .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          files: claude-desktop-rtl-windows.zip
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            1. Download `claude-desktop-rtl-windows.zip` below
+            2. Extract and double-click **`install.bat`**
+            3. Approve the UAC prompt
+
+            See the [README](https://github.com/${{ github.repository }}#readme) for full documentation.
