@@ -247,13 +247,15 @@ function Install-RTLPatch {
         Write-OK "Backup already exists for v$ver -- skipped"
     }
 
-    # --- Extract app.asar ---
+    # --- Extract app.asar (always from the pristine backup, never the live
+    #     file: re-patching with -Force on an already-patched asar would
+    #     otherwise prepend the payload a second time -> double injection) ---
     Write-Step 'Extracting app.asar'
     $extractDir = "$env:TEMP\claude-rtl-extract-$(Get-Random)"
     if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
-    $null = cmd.exe /c "npx --yes @electron/asar extract `"$ASAR`" `"$extractDir`" 2>&1"
+    $null = cmd.exe /c "npx --yes @electron/asar extract `"$backupFile`" `"$extractDir`" 2>&1"
     if ($LASTEXITCODE -ne 0) { Write-Fail "asar extract failed (exit $LASTEXITCODE)" }
-    Write-OK 'Extracted'
+    Write-OK 'Extracted from clean backup'
 
     # --- Inject RTL payload into renderer files ---
     Write-Step 'Injecting RTL payload into renderer files'
