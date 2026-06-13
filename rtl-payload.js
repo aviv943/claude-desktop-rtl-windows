@@ -77,10 +77,28 @@
             return LINE_BREAK_RE.test(el.innerHTML) || /\n/.test(t);
         }
 
+        // Returns true if the element is managed by React's virtual DOM.
+        // Modifying innerHTML on React-managed elements breaks reconciliation
+        // and can trigger React error boundaries ("Something went wrong").
+        function isReactManaged(el) {
+            return Object.keys(el).some(function(k) {
+                return k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance');
+            });
+        }
+
         // Splits a mixed-direction element into per-line <span dir="..."> blocks.
+        // Skips React-managed elements to avoid breaking React reconciliation.
         // Marks the element with data-rtl-split so it is not processed again.
         function splitMixedLines(el) {
             if (el.hasAttribute('data-rtl-split')) return;
+            // Safety: never modify innerHTML of React-controlled elements
+            if (isReactManaged(el)) {
+                // Fall back: set the overall direction from the dominant script
+                var domDir = detectTextDir(el.textContent || '') || 'rtl';
+                el.dir = domDir;
+                el.style.direction = domDir;
+                return;
+            }
             // Split on <br> tags or literal newlines in the HTML source
             var parts = el.innerHTML.split(LINE_BREAK_RE).filter(function(p) {
                 return !/^(<br\s*\/?>|\n)$/i.test(p); // drop the separator captures

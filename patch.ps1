@@ -175,9 +175,9 @@ function Install-RTLPatch {
     }
     Write-OK "Node.js $(node --version)"
 
-    $asarVer = (npx --yes asar --version 2>&1) | Select-Object -First 1
-    if ($LASTEXITCODE -ne 0) { Write-Fail 'asar not available via npx' }
-    Write-OK "asar $asarVer"
+    $asarVer = (npx --yes @electron/asar 2>&1) | Select-Object -First 1
+    # @electron/asar prints usage on no-args (exit 1) — that's fine, it's available
+    Write-OK "@electron/asar available"
 
     if (-not (Test-Path $PAYLOAD_FILE)) {
         Write-Fail "rtl-payload.js not found at: $PAYLOAD_FILE"
@@ -218,7 +218,8 @@ function Install-RTLPatch {
     Write-Step 'Extracting app.asar'
     $extractDir = "$env:TEMP\claude-rtl-extract-$(Get-Random)"
     if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
-    Invoke-Native 'asar extract' { npx --yes asar extract "$ASAR" "$extractDir" } | Out-Null
+    $null = cmd.exe /c "npx --yes @electron/asar extract `"$ASAR`" `"$extractDir`" 2>&1"
+    if ($LASTEXITCODE -ne 0) { Write-Fail "asar extract failed (exit $LASTEXITCODE)" }
     Write-OK 'Extracted'
 
     # --- Inject RTL payload into renderer files ---
@@ -244,7 +245,8 @@ function Install-RTLPatch {
     # --- Pack to a temp file first, then atomically replace ---
     Write-Step 'Repacking app.asar'
     $asarNew = "$env:TEMP\app.asar.rtl-$(Get-Random)"
-    Invoke-Native 'asar pack' { npx --yes asar pack "$extractDir" "$asarNew" } | Out-Null
+    $null = cmd.exe /c "npx --yes @electron/asar pack `"$extractDir`" `"$asarNew`" 2>&1"
+    if ($LASTEXITCODE -ne 0) { Write-Fail "asar pack failed (exit $LASTEXITCODE)" }
     Remove-Item $extractDir -Recurse -Force
     Write-OK 'Packed'
 
@@ -492,7 +494,7 @@ function Show-Diagnose {
         & $add "OS        : $($os.Caption) (Build $($os.BuildNumber))"
         & $add "Version   : $($os.Version)"
     } catch {
-        & $add "OS        : (could not read — $_ )"
+        & $add "OS        : (could not read - $_)"
     }
     & $add "Arch      : $($env:PROCESSOR_ARCHITECTURE)"
     & $add "PowerShell: $($PSVersionTable.PSVersion)"
@@ -526,7 +528,7 @@ function Show-Diagnose {
                 $sample = [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
                 if ($sample -match 'CLAUDE RTL PATCH') { & $add 'Payload  : FOUND (asar is patched)' }
                 else                                   { & $add 'Payload  : NOT FOUND (asar is unpatched)' }
-            } catch { & $add "Payload  : could not read asar — $_" }
+            } catch { & $add "Payload  : could not read asar - $_" }
         }
 
         # Fuse state (read-only, no write, no UAC risk)
