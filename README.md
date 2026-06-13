@@ -116,6 +116,9 @@ Make sure Claude Desktop was installed from [claude.ai/download](https://claude.
 **After a Claude update the patch disappeared**  
 This is expected. Either wait for the next logon (the scheduled task re-patches automatically) or run `.\patch.ps1 -Install` immediately.
 
+**Global hotkeys (AutoHotkey, dictation tools, etc.) stop working while Claude is focused**  
+The patcher launches Claude at *normal* integrity precisely to avoid this. If Claude was patched by an older version it may still be running **elevated**, and Windows UIPI prevents a non-elevated global keyboard hook (`WH_KEYBOARD_LL`) from seeing keys sent to an elevated window — so those hotkeys silently do nothing in the Claude window only. Fix: fully quit Claude (system tray → Quit, or Task Manager → end all `Claude` processes) and reopen it normally from the Start menu. It will run at normal integrity and your global hotkeys will work over Claude again.
+
 **Generate a diagnostic report**
 
 ```powershell

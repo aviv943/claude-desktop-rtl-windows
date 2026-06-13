@@ -123,8 +123,15 @@ function Get-ExePath {
 
 function Invoke-Native {
     # Runs a native command (scriptblock) and throws if it exits non-zero.
+    # Native tools often write progress/warnings to stderr; under
+    # $ErrorActionPreference='Stop' Windows PowerShell 5.1 turns any native
+    # stderr into a fatal NativeCommandError (even with 2>&1). Relax it for the
+    # call and rely on the exit code instead.
     param([string]$Desc, [scriptblock]$Cmd)
-    $output = & $Cmd 2>&1
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try     { $output = & $Cmd 2>&1 }
+    finally { $ErrorActionPreference = $eap }
     if ($LASTEXITCODE -ne 0) {
         $output | ForEach-Object { Write-Host "    $_" }
         Write-Fail "$Desc failed (exit $LASTEXITCODE)"
@@ -163,6 +170,29 @@ function Stop-ClaudeProcesses {
     return $true
 }
 
+function Start-ClaudeDeElevated {
+    # Launches Claude at NORMAL (medium) integrity even though this script runs
+    # elevated. A process started directly from this elevated script would inherit
+    # High integrity, and a High-integrity Claude window blocks the global
+    # low-level keyboard hooks (WH_KEYBOARD_LL) of OTHER non-elevated apps --
+    # dictation / hotkey tools such as AutoHotkey -- whenever Claude is the
+    # foreground window (Windows UIPI). Handing the launch to the medium-integrity
+    # shell (explorer.exe) makes Claude run as a normal user app so those global
+    # hotkeys keep working over the Claude window.
+    param($Package, [string]$ExePath)
+    $env:NODE_NO_WARNINGS = '1'
+    try {
+        $appId = 'Claude'
+        try { $appId = @((Get-AppxPackageManifest $Package).Package.Applications.Application.Id)[0] } catch {}
+        $aumid = "$($Package.PackageFamilyName)!$appId"
+        Start-Process 'explorer.exe' "shell:AppsFolder\$aumid"
+    } catch {
+        Write-Warn "Normal-integrity launch failed ($_); falling back to direct launch."
+        Start-Process $ExePath
+    }
+    $env:NODE_NO_WARNINGS = $null
+}
+
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
@@ -175,9 +205,12 @@ function Install-RTLPatch {
     }
     Write-OK "Node.js $(node --version)"
 
-    $asarVer = (npx --yes @electron/asar 2>&1) | Select-Object -First 1
-    # @electron/asar prints usage on no-args (exit 1) — that's fine, it's available
-    Write-OK "@electron/asar available"
+    # Probe via cmd.exe so npx's stderr (download notices, etc.) can't trip
+    # Windows PowerShell 5.1's NativeCommandError under -ErrorActionPreference Stop.
+    # --version prints to stdout and exits 0, so it's a clean availability check.
+    $asarVer = (cmd.exe /c "npx --yes @electron/asar --version 2>&1") | Select-Object -Last 1
+    if ($LASTEXITCODE -ne 0) { Write-Fail '@electron/asar not available via npx' }
+    Write-OK "@electron/asar $asarVer"
 
     if (-not (Test-Path $PAYLOAD_FILE)) {
         Write-Fail "rtl-payload.js not found at: $PAYLOAD_FILE"
@@ -273,7 +306,7 @@ function Install-RTLPatch {
     # --- Disable ASAR integrity fuse (skip if already disabled to avoid EBUSY) ---
     Write-Step 'Checking ASAR integrity fuse state'
     $env:NODE_NO_WARNINGS = '1'
-    $fuseReadOut = (& npx --yes '@electron/fuses' read --app "$EXE" 2>&1) | Out-String
+    $fuseReadOut = (cmd.exe /c "npx --yes @electron/fuses read --app `"$EXE`" 2>&1") | Out-String
     $env:NODE_NO_WARNINGS = $null
 
     if ($fuseReadOut -match 'EnableEmbeddedAsarIntegrityValidation[^\n]*Disabled') {
@@ -347,10 +380,8 @@ function Install-RTLPatch {
         Start-Sleep -Seconds 1
         if (-not $_.HasExited) { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
     }
-    Write-Host "`n    Reopening Claude Desktop..." -ForegroundColor Cyan
-    $env:NODE_NO_WARNINGS = '1'
-    Start-Process $EXE
-    $env:NODE_NO_WARNINGS = $null
+    Write-Host "`n    Reopening Claude Desktop (at normal integrity)..." -ForegroundColor Cyan
+    Start-ClaudeDeElevated $pkg $EXE
 }
 
 # ---------------------------------------------------------------------------
@@ -423,9 +454,7 @@ function Uninstall-RTLPatch {
         Restore-Permissions $EXE
 
         if ($hadClaude) {
-            $env:NODE_NO_WARNINGS = '1'
-            Start-Process $EXE
-            $env:NODE_NO_WARNINGS = $null
+            Start-ClaudeDeElevated $pkg $EXE
         }
     } else {
         Write-Warn "No backup found for Claude v$ver."
@@ -533,7 +562,7 @@ function Show-Diagnose {
 
         # Fuse state (read-only, no write, no UAC risk)
         $env:NODE_NO_WARNINGS = '1'
-        $fuseOut = (& npx --yes '@electron/fuses' read --app "$EXE" 2>&1) | Out-String
+        $fuseOut = (cmd.exe /c "npx --yes @electron/fuses read --app `"$EXE`" 2>&1") | Out-String
         $env:NODE_NO_WARNINGS = $null
         if      ($fuseOut -match 'EnableEmbeddedAsarIntegrityValidation[^\n]*Disabled') { & $add 'Fuse     : Disabled (correct)' }
         elseif  ($fuseOut -match 'EnableEmbeddedAsarIntegrityValidation[^\n]*Enabled')  { & $add 'Fuse     : Enabled  (patch will not load)' }
