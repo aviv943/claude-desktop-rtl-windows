@@ -247,15 +247,16 @@ function Install-RTLPatch {
         Write-OK "Backup already exists for v$ver -- skipped"
     }
 
-    # --- Extract app.asar (always from the pristine backup, never the live
-    #     file: re-patching with -Force on an already-patched asar would
-    #     otherwise prepend the payload a second time -> double injection) ---
+    # --- Extract app.asar (the LIVE file -- it sits beside its app.asar.unpacked
+    #     sidecar of native modules, which a standalone backup copy lacks, so the
+    #     backup can't be extracted directly). Any previously-injected payload is
+    #     stripped during injection below, so re-patching never stacks copies. ---
     Write-Step 'Extracting app.asar'
     $extractDir = "$env:TEMP\claude-rtl-extract-$(Get-Random)"
     if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
-    $null = cmd.exe /c "npx --yes @electron/asar extract `"$backupFile`" `"$extractDir`" 2>&1"
+    $null = cmd.exe /c "npx --yes @electron/asar extract `"$ASAR`" `"$extractDir`" 2>&1"
     if ($LASTEXITCODE -ne 0) { Write-Fail "asar extract failed (exit $LASTEXITCODE)" }
-    Write-OK 'Extracted from clean backup'
+    Write-OK 'Extracted'
 
     # --- Inject RTL payload into renderer files ---
     Write-Step 'Injecting RTL payload into renderer files'
@@ -273,7 +274,10 @@ function Install-RTLPatch {
 
     foreach ($f in $renderers) {
         $original = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
-        [System.IO.File]::WriteAllText($f.FullName, $payload + "`n" + $original, [System.Text.Encoding]::UTF8)
+        # Strip any previously-injected payload block(s) so re-patching an
+        # already-patched renderer never stacks a second copy.
+        $clean = [regex]::Replace($original, '(?s)// --- CLAUDE RTL PATCH START ---.*?// --- CLAUDE RTL PATCH END ---\r?\n?', '')
+        [System.IO.File]::WriteAllText($f.FullName, $payload + "`n" + $clean, [System.Text.Encoding]::UTF8)
         Write-OK "Patched $($f.Name)"
     }
 
