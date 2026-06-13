@@ -10,7 +10,12 @@
 //   - Chat input box: live direction switching as you type
 //   - Claude's responses: processes during streaming via MutationObserver
 //   - Code blocks: forced LTR regardless of surrounding text
-//   - Mixed content: 3-layer detection (first-strong, strip-LTR, any-RTL)
+//   - Direction decision: a word-count MAJORITY vote per block (modeled on
+//     Google's goog.i18n.bidi.estimateDirection), biased toward RTL, so a
+//     Hebrew sentence that merely opens with an English term ("React הוא…")
+//     still reads right-to-left. Mixed English/Hebrew runs inside a block are
+//     left to the browser's Unicode Bidi Algorithm instead of being split
+//     into per-line pieces (which used to look broken).
 //
 // The code is prepended to Electron renderer JS files inside app.asar.
 // It runs as an IIFE and only activates when `document` is available.
@@ -22,6 +27,11 @@
     if (typeof document === 'undefined') return;
     try {
         var WRITING_SEL = '[data-testid="chat-input"]';
+
+        // Share of strongly-directional words that must be RTL for a block to be
+        // treated as RTL. Deliberately below 0.5: a Hebrew sentence sprinkled
+        // with English technical terms should still read right-to-left.
+        var RTL_THRESHOLD = 0.4;
 
         function isRTL(c) {
             var code = c.charCodeAt(0);
@@ -37,15 +47,8 @@
             return false;
         }
 
-        function firstStrong(text) {
-            if (!text) return null;
-            for (var i = 0; i < text.length; i++) {
-                if (isRTL(text[i])) return 'rtl';
-                if (/[a-zA-Z]/.test(text[i])) return 'ltr';
-            }
-            return null;
-        }
-
+        // Collect an element's text but skip <code>/<pre> so code never sways the
+        // language vote (it is also forced LTR separately).
         function textWithoutCode(el) {
             var out = '';
             var nodes = el.childNodes;
@@ -59,94 +62,33 @@
             return out;
         }
 
-        function stripLeadingLTR(text) {
-            return text
-                .replace(/^[\s]*(?:[\w.\-]+\.[\w]{1,5})\s*/g, '')
-                .replace(/https?:\/\/\S+/g, '')
-                .replace(/[\w.\-]+[\/\\][\w.\-\/\\]+/g, '')
-                .replace(/`[^`]+`/g, '');
-        }
-
-        var LINE_BREAK_RE = /(<br\s*\/?>|\n)/i;
-
-        // Returns true when an element has multi-line mixed RTL+LTR content.
-        // Handles both <br> tags and plain \n newlines (white-space: pre-wrap).
-        function hasMixedLines(el) {
-            var t = el.textContent || '';
-            if (!hasRTL(t) || !/[a-zA-Z]{2,}/.test(t)) return false;
-            return LINE_BREAK_RE.test(el.innerHTML) || /\n/.test(t);
-        }
-
-        // Returns true if the element is managed by React's virtual DOM.
-        // Modifying innerHTML on React-managed elements breaks reconciliation
-        // and can trigger React error boundaries ("Something went wrong").
-        function isReactManaged(el) {
-            return Object.keys(el).some(function(k) {
-                return k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance');
-            });
-        }
-
-        // Splits a mixed-direction element into per-line <span dir="..."> blocks.
-        // Skips React-managed elements to avoid breaking React reconciliation.
-        // Marks the element with data-rtl-split so it is not processed again.
-        function splitMixedLines(el) {
-            if (el.hasAttribute('data-rtl-split')) return;
-            // Safety: never modify innerHTML of React-controlled elements
-            if (isReactManaged(el)) {
-                // Fall back: set the overall direction from the dominant script
-                var domDir = detectTextDir(el.textContent || '') || 'rtl';
-                el.dir = domDir;
-                el.style.direction = domDir;
-                return;
+        // Word-count majority direction (à la goog.i18n.bidi.estimateDirection).
+        // Each whitespace-separated word votes by the script it contains: a word
+        // holding any Hebrew/Arabic letter counts RTL, otherwise a word holding
+        // any Latin letter counts LTR; pure numbers / punctuation / emoji abstain.
+        // Returns 'rtl', 'ltr', or null when there are no directional words.
+        function blockDir(text) {
+            if (!text) return null;
+            var words = text.split(/\s+/);
+            var rtl = 0, ltr = 0;
+            for (var i = 0; i < words.length; i++) {
+                var w = words[i];
+                if (!w) continue;
+                var isR = false, isL = false;
+                for (var j = 0; j < w.length; j++) {
+                    if (isRTL(w[j])) { isR = true; break; }
+                    if (/[A-Za-z]/.test(w[j])) { isL = true; }
+                }
+                if (isR) rtl++;
+                else if (isL) ltr++;
             }
-            // Split on <br> tags or literal newlines in the HTML source
-            var parts = el.innerHTML.split(LINE_BREAK_RE).filter(function(p) {
-                return !/^(<br\s*\/?>|\n)$/i.test(p); // drop the separator captures
-            });
-            if (parts.length < 2) return;
-            var newHtml = parts.map(function(part) {
-                var plain = part.replace(/<[^>]+>/g, '').trim();
-                if (!plain) return '<span style="display:block;min-height:1em"></span>';
-                var dir = detectTextDir(plain);
-                return '<span' + (dir ? ' dir="' + dir + '"' : '') +
-                       ' style="display:block;text-align:start">' + part + '</span>';
-            }).join('');
-            el.setAttribute('data-rtl-split', '1');
-            el.removeAttribute('dir');
-            el.style.direction = '';
-            el.style.textAlign = '';
-            el.innerHTML = newHtml;
+            var total = rtl + ltr;
+            if (total === 0) return null;
+            return (rtl / total) >= RTL_THRESHOLD ? 'rtl' : 'ltr';
         }
 
-        function detectElDir(el) {
-            var full = el.textContent || '';
-            if (!hasRTL(full)) return null;
-            var noCode = textWithoutCode(el);
-            var d = firstStrong(noCode);
-            if (d === 'rtl') return 'rtl';
-            if (d === 'ltr') {
-                // Starts with Latin -- strip common LTR prefixes (paths, URLs, code)
-                // and re-check. Only force RTL if the stripped text leads with RTL.
-                var stripped = stripLeadingLTR(noCode);
-                d = firstStrong(stripped);
-                if (d === 'rtl') return 'rtl';
-                // Still starts with Latin after stripping → keep LTR
-                return null;
-            }
-            // No strong character found but RTL chars exist → treat as RTL
-            return 'rtl';
-        }
-
-        function detectTextDir(text) {
-            if (!text || !text.trim()) return null;
-            var d = firstStrong(text);
-            if (d === 'rtl') return 'rtl';
-            if (!hasRTL(text)) return 'ltr';
-            var stripped = stripLeadingLTR(text);
-            d = firstStrong(stripped);
-            if (d === 'rtl') return 'rtl';
-            return 'rtl';
-        }
+        // Direction of a plain string (chat input box, inline containers).
+        function detectTextDir(text) { return blockDir(text); }
 
         function qsa(root, sel) {
             var base = root.querySelectorAll ? root : document;
@@ -164,83 +106,90 @@
             });
         }
 
-        function processText(root) {
-            qsa(root, 'p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, summary, label, dt, dd').forEach(function(el) {
-                if (el.closest(WRITING_SEL) || el.closest('pre') || el.closest('.code-block__code')) return;
-                if (el.hasAttribute('data-rtl-split')) return; // already split into per-line spans
-                var dir = detectElDir(el);
-                if (dir) {
-                    // Before forcing the whole element RTL, check if it has mixed-direction
-                    // lines separated by <br>. If so, split into per-line spans instead.
-                    if (dir === 'rtl' && hasMixedLines(el)) {
-                        splitMixedLines(el);
-                        return;
-                    }
-                    el.dir = dir;
-                    el.style.direction = dir;
-                    if (el.tagName === 'LI') {
-                        el.style.listStylePosition = (dir === 'rtl') ? 'inside' : '';
-                        var parentList = el.closest('ul, ol');
-                        if (parentList && dir === 'rtl' && !parentList.hasAttribute('dir')) {
-                            parentList.dir = 'rtl';
-                            parentList.style.direction = 'rtl';
-                            var pl = getComputedStyle(parentList).paddingLeft;
-                            if (parseFloat(pl) > 0) { parentList.style.paddingRight = pl; parentList.style.paddingLeft = '0'; }
-                        }
-                    }
+        // Apply a block's majority direction, then let native bidi handle the
+        // mixed runs inside it. RTL wins outright; LTR is only forced when the
+        // element is currently rendering RTL (e.g. it inherited RTL from a parent
+        // or we set it earlier and the text has since changed) so we don't stamp
+        // dir across Claude's whole English UI.
+        function applyBlockDir(el) {
+            var dir = blockDir(textWithoutCode(el));
+            if (dir === 'rtl') {
+                el.dir = 'rtl';
+                el.style.direction = 'rtl';
+            } else {
+                if (window.getComputedStyle(el).direction === 'rtl') {
+                    el.dir = 'ltr';
+                    el.style.direction = 'ltr';
                 } else {
-                    // Use computed direction to detect RTL context from any source
-                    // (dir attribute, inline style, or CSS class from Claude Desktop itself).
-                    if (window.getComputedStyle(el).direction === 'rtl') {
-                        el.dir = 'ltr';
-                        el.style.direction = 'ltr';
-                    } else {
-                        if (el.hasAttribute('dir')) el.removeAttribute('dir');
-                        el.style.direction = '';
-                    }
-                    if (el.tagName === 'LI') el.style.listStylePosition = '';
+                    if (el.hasAttribute('dir')) el.removeAttribute('dir');
+                    el.style.direction = '';
+                }
+            }
+        }
+
+        function setListItemsDir(list, dir) {
+            list.querySelectorAll(':scope > li').forEach(function(li) {
+                li.dir = dir;
+                li.style.direction = dir;
+                li.style.listStylePosition = (dir === 'rtl') ? 'inside' : '';
+            });
+        }
+
+        function clearListItems(list) {
+            list.querySelectorAll(':scope > li').forEach(function(li) {
+                if (li.hasAttribute('dir')) li.removeAttribute('dir');
+                li.style.direction = '';
+                li.style.listStylePosition = '';
+            });
+        }
+
+        function processText(root) {
+            // Lists pick ONE direction for the whole list (whole-list majority)
+            // and apply it to every item, so bullets/numbers never flip
+            // item-by-item.
+            qsa(root, 'ul, ol').forEach(function(list) {
+                if (list.closest(WRITING_SEL) || list.closest('pre')) return;
+                var dir = blockDir(textWithoutCode(list));
+                if (dir === 'rtl') {
+                    list.dir = 'rtl';
+                    list.style.direction = 'rtl';
+                    var pl = getComputedStyle(list).paddingLeft;
+                    if (parseFloat(pl) > 0) { list.style.paddingRight = pl; list.style.paddingLeft = '0'; }
+                    setListItemsDir(list, 'rtl');
+                } else if (dir === 'ltr' && window.getComputedStyle(list).direction === 'rtl') {
+                    list.dir = 'ltr';
+                    list.style.direction = 'ltr';
+                    list.style.paddingRight = ''; list.style.paddingLeft = '';
+                    setListItemsDir(list, 'ltr');
+                } else {
+                    if (list.hasAttribute('dir')) list.removeAttribute('dir');
+                    list.style.direction = '';
+                    list.style.paddingRight = ''; list.style.paddingLeft = '';
+                    clearListItems(list);
                 }
             });
 
-            qsa(root, 'ul, ol').forEach(function(el) {
-                if (el.closest(WRITING_SEL) || el.closest('pre')) return;
-                var dir = detectElDir(el);
-                if (dir === 'rtl') {
-                    el.dir = 'rtl';
-                    el.style.direction = 'rtl';
-                    var pl = getComputedStyle(el).paddingLeft;
-                    if (parseFloat(pl) > 0) { el.style.paddingRight = pl; el.style.paddingLeft = '0'; }
-                } else {
-                    if (window.getComputedStyle(el).direction === 'rtl') {
-                        el.dir = 'ltr';
-                        el.style.direction = 'ltr';
-                    } else {
-                        if (el.hasAttribute('dir')) el.removeAttribute('dir');
-                        el.style.direction = '';
-                    }
-                    el.style.paddingRight = ''; el.style.paddingLeft = '';
-                }
+            // Standalone block elements each decide by their own majority.
+            // (List items are handled above, via their list.)
+            qsa(root, 'p, h1, h2, h3, h4, h5, h6, blockquote, td, th, summary, label, dt, dd').forEach(function(el) {
+                if (el.closest(WRITING_SEL) || el.closest('pre') || el.closest('.code-block__code')) return;
+                applyBlockDir(el);
             });
         }
 
         function processContainers(root) {
             qsa(root, 'div, span, button, a, label').forEach(function(el) {
                 if (el.closest('pre') || el.closest('code') || el.closest(WRITING_SEL)) return;
-                // Skip elements we've already split, and their span children
-                if (el.hasAttribute('data-rtl-split')) return;
-                if (el.parentElement && el.parentElement.hasAttribute('data-rtl-split')) return;
                 if (el.querySelector('p, div, ul, ol, h1, h2, h3, h4, h5, h6, pre, table')) return;
                 if (/^(P|LI|H[1-6]|BLOCKQUOTE|TD|TH|UL|OL)$/.test(el.tagName)) return;
                 var text = (el.textContent || '').trim();
                 if (text.length < 2) return;
+                // Only touch containers that actually carry RTL text; leave the
+                // English UI alone. Direction is the majority vote; native bidi
+                // then orders any embedded opposite-script runs.
                 if (hasRTL(text)) {
-                    // Mixed lines? Split each line into its own span instead of forcing one dir.
-                    if ((LINE_BREAK_RE.test(el.innerHTML) || /\n/.test(text)) && /[a-zA-Z]{2,}/.test(text)) {
-                        splitMixedLines(el);
-                    } else {
-                        el.dir = detectTextDir(text) || 'rtl';
-                        el.style.textAlign = 'start';
-                    }
+                    el.dir = blockDir(text) || 'rtl';
+                    el.style.textAlign = 'start';
                 } else if (el.hasAttribute('dir')) {
                     el.removeAttribute('dir');
                     el.style.textAlign = '';
