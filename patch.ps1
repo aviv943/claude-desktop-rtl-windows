@@ -193,10 +193,75 @@ function Start-ClaudeDeElevated {
     $env:NODE_NO_WARNINGS = $null
 }
 
+function Test-FuseDisabled {
+    # Returns $true if the ASAR integrity validation fuse reads back as Disabled.
+    param([string]$ExePath)
+    $env:NODE_NO_WARNINGS = '1'
+    try {
+        $out = (cmd.exe /c "npx --yes @electron/fuses read --app `"$ExePath`" 2>&1") | Out-String
+    } finally { $env:NODE_NO_WARNINGS = $null }
+    return ($out -match 'EnableEmbeddedAsarIntegrityValidation[^\r\n]*Disabled')
+}
+
+function Set-AsarFuseDisabled {
+    # Turns the ASAR integrity fuse OFF and VERIFIES it by reading it back.
+    # The fuse write fails if claude.exe is still running/locked, so we fully
+    # stop Claude and retry. Hard-fails if it can't be confirmed disabled --
+    # callers rely on that to abort before modifying app.asar.
+    param([string]$ExePath)
+
+    if (Test-FuseDisabled $ExePath) {
+        Write-OK 'Fuse already disabled -- skipping write'
+        return
+    }
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        Stop-ClaudeProcesses | Out-Null
+        Start-Sleep -Seconds 3
+        $env:NODE_NO_WARNINGS = '1'
+        $out  = cmd.exe /c "npx --yes @electron/fuses write --app `"$ExePath`" EnableEmbeddedAsarIntegrityValidation=off 2>&1"
+        $code = $LASTEXITCODE
+        $env:NODE_NO_WARNINGS = $null
+
+        if ($code -eq 0 -and (Test-FuseDisabled $ExePath)) { return }
+
+        Write-Warn "Fuse write attempt $attempt/5 failed (exit $code; claude.exe may be busy) -- retrying..."
+        $out | ForEach-Object { Write-Host "    $_" }
+    }
+
+    Write-Fail @'
+Could not disable the ASAR integrity fuse after 5 attempts.
+app.asar was NOT modified, so Claude Desktop still works normally.
+Fully quit Claude Desktop (check the system tray) and re-run with -Install.
+'@
+}
+
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
 function Install-RTLPatch {
+
+    # --- Locate Claude + version check FIRST ---
+    # The auto-patch task fires on every MSIX register (event 613), most of which
+    # are other apps (OneDrive, Edge, ...). Doing the cheap version check before
+    # the slower Node/npx dependency probes lets those spurious runs exit in ~1s.
+    Write-Step 'Locating Claude Desktop installation'
+    $pkg  = Get-ClaudePackage
+    $ver  = $pkg.Version.ToString()
+    $ASAR = Get-AsarPath $pkg
+    $EXE  = Get-ExePath  $pkg
+    Write-OK "Claude $ver"
+    Write-OK "Location: $($pkg.InstallLocation)"
+
+    # --- Version check ---
+    if (-not $Force -and (Test-Path $VERSION_FILE)) {
+        $cached = (Get-Content $VERSION_FILE -Raw).Trim()
+        if ($cached -eq $ver) {
+            Write-Host "`n    Claude RTL is already patched (v$ver). Use -Force to reinstall." -ForegroundColor Green
+            return
+        }
+        Write-Warn "Claude was updated: $cached -> $ver. Reapplying patch..."
+    }
 
     Write-Step 'Checking dependencies'
 
@@ -216,25 +281,6 @@ function Install-RTLPatch {
         Write-Fail "rtl-payload.js not found at: $PAYLOAD_FILE"
     }
     Write-OK 'RTL payload found'
-
-    # --- Locate Claude ---
-    Write-Step 'Locating Claude Desktop installation'
-    $pkg  = Get-ClaudePackage
-    $ver  = $pkg.Version.ToString()
-    $ASAR = Get-AsarPath $pkg
-    $EXE  = Get-ExePath  $pkg
-    Write-OK "Claude $ver"
-    Write-OK "Location: $($pkg.InstallLocation)"
-
-    # --- Version check ---
-    if (-not $Force -and (Test-Path $VERSION_FILE)) {
-        $cached = (Get-Content $VERSION_FILE -Raw).Trim()
-        if ($cached -eq $ver) {
-            Write-Host "`n    Claude RTL is already patched (v$ver). Use -Force to reinstall." -ForegroundColor Green
-            return
-        }
-        Write-Warn "Claude was updated: $cached -> $ver. Reapplying patch..."
-    }
 
     # --- Backup original asar (once per version) ---
     Write-Step 'Backing up original app.asar'
@@ -282,14 +328,38 @@ function Install-RTLPatch {
     }
 
     # --- Pack to a temp file first, then atomically replace ---
+    # Native binaries MUST stay outside the archive in app.asar.unpacked -- the
+    # OS loads them via dlopen/LoadLibrary/CreateProcess, which cannot read from
+    # a virtual asar path. Without this --unpack rule they get packed INTO the
+    # asar and Claude crashes on launch.
+    #
+    # The factory build unpacks EXACTLY the .node / .dll / .exe files (the
+    # claude-native + node-pty + office365-mcp binaries) and nothing else -- the
+    # large .mjs files in those same folders stay packed. So we match by
+    # extension only: unpacking whole directories would also externalize those
+    # .mjs files, and since we keep the existing on-disk app.asar.unpacked
+    # sidecar (which never contained them), they'd go missing and break the
+    # office365-mcp / pdf features.
     Write-Step 'Repacking app.asar'
     $asarNew = "$env:TEMP\app.asar.rtl-$(Get-Random)"
-    $null = cmd.exe /c "npx --yes @electron/asar pack `"$extractDir`" `"$asarNew`" 2>&1"
+    $unpack  = '*.{node,dll,exe}'
+    $null = cmd.exe /c "npx --yes @electron/asar pack `"$extractDir`" `"$asarNew`" --unpack `"$unpack`" 2>&1"
     if ($LASTEXITCODE -ne 0) { Write-Fail "asar pack failed (exit $LASTEXITCODE)" }
     Remove-Item $extractDir -Recurse -Force
-    Write-OK 'Packed'
 
-    # --- Stop Claude so we can replace claude.exe (needed for fuse) ---
+    # Guard: confirm the repack actually externalized the native modules. If the
+    # .unpacked sidecar is missing/empty the glob didn't match -- abort rather
+    # than install an asar that swallows the native modules.
+    $asarNewUnpacked = "$asarNew.unpacked"
+    $unpackedNodes = @(Get-ChildItem $asarNewUnpacked -Recurse -Filter '*.node' -ErrorAction SilentlyContinue)
+    if ($unpackedNodes.Count -lt 1) {
+        Remove-Item $asarNew -Force -ErrorAction SilentlyContinue
+        Remove-Item $asarNewUnpacked -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Fail 'Repack did not unpack any native (.node) modules -- aborting to avoid a broken launch. The asar --unpack glob may need updating.'
+    }
+    Write-OK "Packed ($($unpackedNodes.Count) native modules kept unpacked)"
+
+    # --- Stop Claude so we can replace claude.exe + app.asar ---
     $hadClaude = Stop-ClaudeProcesses
     if ($hadClaude) { Write-OK 'Claude Desktop stopped' }
 
@@ -300,41 +370,26 @@ function Install-RTLPatch {
     Grant-WriteAccess $EXE
     Write-OK 'claude.exe -- write granted'
 
+    # --- Disable the ASAR integrity fuse BEFORE swapping the asar ---
+    # With the fuse on, an integrity-validated Electron rejects the modified
+    # asar and refuses to launch. Disabling (and verifying) it first means a
+    # failure here aborts while the ORIGINAL, working asar is still in place --
+    # never leaving a modified-asar + enabled-fuse combination that won't start.
+    Write-Step 'Disabling ASAR integrity fuse on claude.exe'
+    Set-AsarFuseDisabled $EXE
+    Write-OK 'ASAR integrity fuse is Disabled (verified)'
+
     # --- Overwrite app.asar in-place ---
     # We only have file-level write access (not parent-dir write), so renaming or
     # moving inside WindowsApps is denied.  [IO.File]::Copy with overwrite=true
-    # works with just file-level write permission.
+    # works with just file-level write permission. The native modules stay in the
+    # existing resources\app.asar.unpacked sidecar (untouched), which the freshly
+    # repacked header references.
     Write-Step 'Installing patched app.asar'
     [System.IO.File]::Copy($asarNew, $ASAR, $true)
     Remove-Item $asarNew -Force -ErrorAction SilentlyContinue
+    Remove-Item $asarNewUnpacked -Recurse -Force -ErrorAction SilentlyContinue
     Write-OK 'app.asar replaced'
-
-    # --- Disable ASAR integrity fuse (skip if already disabled to avoid EBUSY) ---
-    Write-Step 'Checking ASAR integrity fuse state'
-    $env:NODE_NO_WARNINGS = '1'
-    $fuseReadOut = (cmd.exe /c "npx --yes @electron/fuses read --app `"$EXE`" 2>&1") | Out-String
-    $env:NODE_NO_WARNINGS = $null
-
-    if ($fuseReadOut -match 'EnableEmbeddedAsarIntegrityValidation[^\n]*Disabled') {
-        Write-OK 'ASAR integrity fuse already disabled -- skipping write'
-    } else {
-        Write-Step 'Disabling ASAR integrity fuse on claude.exe'
-        # Stop any Claude processes that may have restarted since we last stopped them
-        Stop-ClaudeProcesses | Out-Null
-        Start-Sleep -Seconds 2
-        $env:NODE_NO_WARNINGS = '1'
-        try {
-            $fuseOut = Invoke-Native '@electron/fuses write' {
-                npx --yes '@electron/fuses' write --app "$EXE" EnableEmbeddedAsarIntegrityValidation=off
-            }
-            $fuseOut | ForEach-Object { Write-Host "    $_" }
-            Write-OK 'Fuse disabled'
-        } catch {
-            Write-Warn "Fuse write failed (claude.exe may be busy): $_"
-            Write-Warn "The asar patch is installed. Re-run -Install when Claude is fully closed to disable the fuse."
-        }
-        $env:NODE_NO_WARNINGS = $null
-    }
 
     # --- Restore original (restrictive) permissions ---
     Write-Step 'Restoring file permissions'
@@ -351,7 +406,7 @@ function Install-RTLPatch {
     # --- Register scheduled task (logon, admin, 30-second startup delay) ---
     Write-Step 'Registering auto-patch scheduled task'
     Register-AutoPatchTask
-    Write-OK "Task '$TASK_NAME' registered -- fires at logon, 30s delay"
+    Write-OK "Task '$TASK_NAME' registered -- fires at logon and on Claude auto-update"
 
     # --- Remove old Claude-RTL copy (from prior approach) if present ---
     $oldDir = "$env:LOCALAPPDATA\Claude-RTL"
@@ -374,7 +429,8 @@ function Install-RTLPatch {
     Write-Host '=====================================================' -ForegroundColor Green
     Write-Host ' Claude RTL patch applied!' -ForegroundColor Green
     Write-Host ' Open Claude Desktop normally -- RTL is active.' -ForegroundColor Green
-    Write-Host ' After future Claude updates, the patch reapplies at next logon.' -ForegroundColor Green
+    Write-Host ' After future Claude updates, the patch reapplies automatically' -ForegroundColor Green
+    Write-Host ' within seconds (or at next logon as a fallback).' -ForegroundColor Green
     Write-Host '=====================================================' -ForegroundColor Green
 
     # Always restart Claude after patching so the new asar is loaded.
@@ -398,9 +454,26 @@ function Register-AutoPatchTask {
         -Execute   'powershell.exe' `
         -Argument  "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Install"
 
-    # Run at logon with a 30-second delay so Claude doesn't beat us to startup
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
-    $trigger.Delay = 'PT30S'
+    # --- Trigger 1: at logon (30s delay) ---
+    # Catches updates that were applied while signed out / before this session.
+    $logon = New-ScheduledTaskTrigger -AtLogOn
+    $logon.Delay = 'PT30S'
+
+    # --- Trigger 2: the instant Claude finishes (re)registering after an update ---
+    # An MSIX update raises AppxDeploymentServer event 613 ("Deployment Register
+    # operation") for the new package version. This fires the re-patch within
+    # seconds of an in-session auto-update, instead of waiting for the next logon.
+    # The Windows event-query engine has no string functions, so we can't filter
+    # by package name -- we match ANY 613 and let the version check above no-op
+    # for non-Claude packages. The 15s delay lets the new files settle first.
+    $subscription = @'
+<QueryList><Query Id="0" Path="Microsoft-Windows-AppxDeploymentServer/Operational"><Select Path="Microsoft-Windows-AppxDeploymentServer/Operational">*[System[Provider[@Name='Microsoft-Windows-AppXDeployment-Server'] and (EventID=613)]]</Select></Query></QueryList>
+'@
+    $evtClass = Get-CimClass -Namespace 'Root/Microsoft/Windows/TaskScheduler' -ClassName 'MSFT_TaskEventTrigger'
+    $onUpdate = New-CimInstance -CimClass $evtClass -ClientOnly
+    $onUpdate.Enabled      = $true
+    $onUpdate.Subscription = $subscription
+    $onUpdate.Delay        = 'PT15S'
 
     $settings = New-ScheduledTaskSettingsSet `
         -ExecutionTimeLimit    (New-TimeSpan -Minutes 10) `
@@ -417,10 +490,10 @@ function Register-AutoPatchTask {
     Register-ScheduledTask `
         -TaskName   $TASK_NAME `
         -Action     $action `
-        -Trigger    $trigger `
+        -Trigger    @($logon, $onUpdate) `
         -Settings   $settings `
         -Principal  $principal `
-        -Description 'Re-applies Claude RTL patch when Claude auto-updates. Registered by patch.ps1.' `
+        -Description 'Re-applies Claude RTL patch at logon and the moment Claude auto-updates (AppX deployment event 613). Registered by patch.ps1.' `
         -Force | Out-Null
 }
 
