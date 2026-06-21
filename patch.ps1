@@ -171,26 +171,36 @@ function Stop-ClaudeProcesses {
 }
 
 function Start-ClaudeDeElevated {
-    # Launches Claude at NORMAL (medium) integrity even though this script runs
-    # elevated. A process started directly from this elevated script would inherit
-    # High integrity, and a High-integrity Claude window blocks the global
-    # low-level keyboard hooks (WH_KEYBOARD_LL) of OTHER non-elevated apps --
-    # dictation / hotkey tools such as AutoHotkey -- whenever Claude is the
-    # foreground window (Windows UIPI). Handing the launch to the medium-integrity
-    # shell (explorer.exe) makes Claude run as a normal user app so those global
-    # hotkeys keep working over the Claude window.
+    # Relaunch Claude at NORMAL (medium) integrity even though this script runs
+    # elevated. claude.exe is asInvoker, so it inherits the launcher's integrity.
+    # Launching it directly -- or even handing off to explorer.exe -- still yields
+    # a High-integrity Claude when we run from the elevated auto-patch scheduled
+    # task (the launch carries our elevated token). A High-integrity Claude window
+    # then blocks the global low-level keyboard hooks (WH_KEYBOARD_LL) of OTHER
+    # non-elevated apps -- dictation / hotkey tools such as AutoHotkey -- whenever
+    # Claude is the foreground window (Windows UIPI), so their hotkeys stop
+    # working over the Claude window only.
+    #
+    # Reliable fix: bounce the launch through a throwaway RunLevel=Limited
+    # scheduled task. A Limited task runs at medium integrity, so the app it
+    # starts is medium too -- independent of our own integrity or context.
     param($Package, [string]$ExePath)
-    $env:NODE_NO_WARNINGS = '1'
+    $launchTask = 'Claude RTL Launch'
     try {
-        $appId = 'Claude'
-        try { $appId = @((Get-AppxPackageManifest $Package).Package.Applications.Application.Id)[0] } catch {}
-        $aumid = "$($Package.PackageFamilyName)!$appId"
-        Start-Process 'explorer.exe' "shell:AppsFolder\$aumid"
+        $action    = New-ScheduledTaskAction -Execute $ExePath
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId    ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+            -LogonType Interactive `
+            -RunLevel  Limited
+        Register-ScheduledTask -TaskName $launchTask -Action $action -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName $launchTask
+        Start-Sleep -Seconds 5
+        Unregister-ScheduledTask -TaskName $launchTask -Confirm:$false -ErrorAction SilentlyContinue
     } catch {
-        Write-Warn "Normal-integrity launch failed ($_); falling back to direct launch."
-        Start-Process $ExePath
+        Write-Warn "Medium-integrity relaunch failed ($_); falling back to direct launch."
+        Unregister-ScheduledTask -TaskName $launchTask -Confirm:$false -ErrorAction SilentlyContinue
+        $env:NODE_NO_WARNINGS = '1'; Start-Process $ExePath; $env:NODE_NO_WARNINGS = $null
     }
-    $env:NODE_NO_WARNINGS = $null
 }
 
 function Test-FuseDisabled {
